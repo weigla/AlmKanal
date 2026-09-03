@@ -10,10 +10,7 @@ def audio_trial_realignment_spec() -> StepSpec:
             'onset_trigger_to_wav',
             'end_triggers',
             'alignment_kwargs',
-            'n_trials_found',
-            'n_trials_aligned',
-            'n_trials_failed',
-            'output_duration_s',
             'preserve_annotations',
+            'on_alignment_error',
         )
     )

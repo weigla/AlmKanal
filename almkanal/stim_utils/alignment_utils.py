@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 import warnings
-from fractions import Fraction
+from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import librosa
 import mne
 import numpy as np
-from numpy.typing import NDArray
-from scipy.signal import butter, correlate, hilbert, resample_poly, sosfiltfilt
+from scipy.signal import butter, correlate, hilbert, sosfiltfilt
 from scipy.stats import theilslopes
+
+from almkanal.stim_utils.audio_utils import resample_poly_exact
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from numpy.typing import NDArray
+
 VARIANCE_EPSILON = 1e-12
 ENERGY_EPSILON = 1e-20
+MIN_ANCHORS_FOR_DRIFT = 2
 
 
 def resolve_stim_channel(raw: mne.io.BaseRaw, stim_channel: str | None) -> str:
@@ -33,7 +37,7 @@ def resolve_stim_channel(raw: mne.io.BaseRaw, stim_channel: str | None) -> str:
     return raw.ch_names[picks[0]]
 
 
-def find_audio_trials(
+def find_audio_trials(  # noqa: C901
     raw: mne.io.BaseRaw,
     onset_trigger_to_wav: Mapping[int, str | Path],
     end_triggers: int | Sequence[int],
@@ -45,8 +49,14 @@ def find_audio_trials(
         raise ValueError('onset_trigger_to_wav must contain at least one onset-trigger/WAV pair.')
 
     stim_channel = resolve_stim_channel(raw, stim_channel)
-    onset_codes = {int(code) for code in onset_trigger_to_wav}
-    end_codes = {int(end_triggers)} if isinstance(end_triggers, int) else {int(code) for code in end_triggers}
+    trigger_to_wav = {int(code): wav_file for code, wav_file in onset_trigger_to_wav.items()}
+    if len(trigger_to_wav) != len(onset_trigger_to_wav):
+        raise ValueError('onset_trigger_to_wav contains trigger keys that collapse to the same integer value.')
+    onset_codes = set(trigger_to_wav)
+    if isinstance(end_triggers, Integral):
+        end_codes = {int(end_triggers)}
+    else:
+        end_codes = {int(code) for code in cast('Sequence[int]', end_triggers)}
     if not end_codes:
         raise ValueError('end_triggers must contain at least one trigger value.')
     overlap = onset_codes & end_codes
@@ -58,6 +68,7 @@ def find_audio_trials(
         stim_channel=stim_channel,
         shortest_event=1,
         consecutive=True,
+        initial_event=True,
         verbose=False,
     )
 
@@ -73,7 +84,7 @@ def find_audio_trials(
                 raise RuntimeError('New audio onset before the preceding end trigger.')
             current = {
                 'onset_code': event_value,
-                'wav_file': str(onset_trigger_to_wav[event_value]),
+                'wav_file': str(trigger_to_wav[event_value]),
                 'onset_sample': sample,
             }
         elif current is not None and event_value in end_codes:
@@ -96,28 +107,28 @@ def _make_sync_envelope(
     band: tuple[float, float],
     envelope_lowpass: float,
 ) -> NDArray[np.float64]:
+    if sfreq <= 0 or target_sfreq <= 0:
+        raise ValueError('Sampling frequencies must be positive.')
     signal = np.asarray(signal, dtype=float)
     signal -= np.mean(signal)
     if np.std(signal) < VARIANCE_EPSILON:
         raise ValueError('Audio signal has essentially zero variance.')
 
     nyquist = sfreq / 2.0
-    low = band[0] / nyquist
-    high = min(band[1] / nyquist, 0.99)
+    low = float(band[0])
+    high = min(float(band[1]), 0.99 * nyquist)
     if low <= 0 or low >= high:
         raise ValueError(f'Invalid audio band {band} for sfreq={sfreq}.')
 
-    signal = sosfiltfilt(butter(4, [low, high], btype='bandpass', output='sos'), signal)
+    signal = sosfiltfilt(butter(4, [low, high], btype='bandpass', fs=sfreq, output='sos'), signal)
     envelope = np.abs(hilbert(signal))
 
-    lowpass = envelope_lowpass / nyquist
-    if lowpass >= 1:
-        raise ValueError('envelope_lowpass must be below the Nyquist frequency.')
-    envelope = sosfiltfilt(butter(4, lowpass, btype='lowpass', output='sos'), envelope)
+    if envelope_lowpass <= 0 or envelope_lowpass >= min(nyquist, target_sfreq / 2.0):
+        raise ValueError('envelope_lowpass must be positive and below both input and target Nyquist frequencies.')
+    envelope = sosfiltfilt(butter(4, envelope_lowpass, btype='lowpass', fs=sfreq, output='sos'), envelope)
 
     if not np.isclose(sfreq, target_sfreq):
-        ratio = Fraction(target_sfreq / sfreq).limit_denominator(10_000)
-        envelope = resample_poly(envelope, up=ratio.numerator, down=ratio.denominator)
+        envelope = resample_poly_exact(envelope, sfreq, target_sfreq)
 
     envelope -= np.mean(envelope)
     scale = np.std(envelope)
@@ -199,7 +210,7 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     raw_trial: mne.io.BaseRaw,
     wav_file: str | Path,
     *,
-    audio_channels: tuple[str, ...],
+    audio_channels: Sequence[str],
     sync_sfreq: float = 500.0,
     audio_band: tuple[float, float] = (80.0, 2000.0),
     envelope_lowpass: float = 30.0,
@@ -212,109 +223,121 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Estimate ``t_raw = offset + clock_slope * t_wav`` for one trial."""
+    if not isinstance(raw_trial, mne.io.BaseRaw):
+        raise TypeError('raw_trial must be an MNE Raw object.')
+    if isinstance(audio_channels, str) or not audio_channels:
+        raise ValueError('audio_channels must contain at least one channel name.')
+    if sync_sfreq <= 0 or window_s <= 0 or step_s <= 0:
+        raise ValueError('sync_sfreq, window_s, and step_s must be positive.')
+    if max_lag_s < 0:
+        raise ValueError('max_lag_s must be non-negative.')
+    if not -1 <= min_corr <= 1:
+        raise ValueError('min_corr must be between -1 and 1.')
+    if min_anchors < MIN_ANCHORS_FOR_DRIFT:
+        raise ValueError('min_anchors must be at least 2 to estimate clock drift.')
+
     raw_sfreq = float(raw_trial.info['sfreq'])
     missing = [channel for channel in audio_channels if channel not in raw_trial.ch_names]
     if missing:
         raise ValueError(f'Missing audio channels: {missing}')
 
     recorded = raw_trial.get_data(picks=list(audio_channels))
-    wav, wav_sfreq = librosa.load(Path(wav_file), sr=None, mono=False)
+    wav_path = Path(wav_file)
+    if not wav_path.is_file():
+        raise FileNotFoundError(f'WAV file does not exist: {wav_path}')
+    wav, wav_sfreq = librosa.load(wav_path, sr=None, mono=False)
     wav = np.asarray(wav, dtype=float)
     if wav.ndim == 1:
         wav = wav[np.newaxis, :]
     wav_sfreq = float(wav_sfreq)
     wav_duration_s = wav.shape[-1] / wav_sfreq
 
-    recorded_sync = np.vstack(
-        [
-            _make_sync_envelope(
+    recorded_sync: list[tuple[int, NDArray[np.float64]]] = []
+    for channel_index, channel in enumerate(recorded):
+        try:
+            envelope = _make_sync_envelope(
                 channel,
                 raw_sfreq,
                 target_sfreq=sync_sfreq,
                 band=audio_band,
                 envelope_lowpass=envelope_lowpass,
             )
-            for channel in recorded
-        ]
-    )
-    wav_sync = np.vstack(
-        [
-            _make_sync_envelope(
+        except ValueError:
+            continue
+        recorded_sync.append((channel_index, envelope))
+    if not recorded_sync:
+        raise RuntimeError('None of the recorded audio channels contains a usable signal.')
+
+    wav_sync: list[tuple[int, NDArray[np.float64]]] = []
+    for channel_index, channel in enumerate(wav):
+        try:
+            envelope = _make_sync_envelope(
                 channel,
                 wav_sfreq,
                 target_sfreq=sync_sfreq,
                 band=audio_band,
                 envelope_lowpass=envelope_lowpass,
             )
-            for channel in wav
-        ]
-    )
+        except ValueError:
+            continue
+        wav_sync.append((channel_index, envelope))
+    if not wav_sync:
+        raise RuntimeError('None of the WAV channels contains a usable signal.')
 
-    usable_duration = min(recorded_sync.shape[-1], wav_sync.shape[-1]) / sync_sfreq
+    usable_duration = min(
+        max(len(envelope) for _, envelope in recorded_sync),
+        max(len(envelope) for _, envelope in wav_sync),
+    ) / sync_sfreq
     first_center = window_s / 2 + max_lag_s
     last_center = usable_duration - window_s / 2 - max_lag_s
-    if last_center <= first_center:
+    if last_center < first_center:
         raise RuntimeError('Trial is too short for the requested synchronization settings.')
     centers = np.arange(first_center, last_center + 1e-12, step_s)
 
-    pair_results: dict[tuple[int, int], dict[str, Any]] = {}
-    for recorded_index in range(recorded_sync.shape[0]):
-        for wav_index in range(wav_sync.shape[0]):
+    best_pair: tuple[int, int] | None = None
+    best_score = -np.inf
+    best_times: NDArray[np.float64] | None = None
+    best_lags: NDArray[np.float64] | None = None
+    best_correlations: NDArray[np.float64] | None = None
+    for recorded_index, recorded_envelope in recorded_sync:
+        for wav_index, wav_envelope in wav_sync:
+            pair_times: list[float] = []
             pair_lags: list[float] = []
             pair_correlations: list[float] = []
             for center in centers:
                 lag, correlation = _estimate_window_lag(
-                    recorded_sync[recorded_index],
-                    wav_sync[wav_index],
+                    recorded_envelope,
+                    wav_envelope,
                     center_s=float(center),
                     sfreq=sync_sfreq,
                     window_s=window_s,
                     max_lag_s=max_lag_s,
                 )
                 if lag is not None and correlation is not None and np.isfinite(correlation):
+                    pair_times.append(float(center))
                     pair_lags.append(lag)
                     pair_correlations.append(correlation)
             if pair_correlations:
-                pair_results[(recorded_index, wav_index)] = {
-                    'median_corr': float(np.median(pair_correlations)),
-                    'mean_corr': float(np.mean(pair_correlations)),
-                    'lags': np.asarray(pair_lags, dtype=float),
-                    'corrs': np.asarray(pair_correlations, dtype=float),
-                }
+                score = float(np.median(pair_correlations))
+                if score > best_score:
+                    best_pair = (recorded_index, wav_index)
+                    best_score = score
+                    best_times = np.asarray(pair_times, dtype=float)
+                    best_lags = np.asarray(pair_lags, dtype=float)
+                    best_correlations = np.asarray(pair_correlations, dtype=float)
 
-    if not pair_results:
+    if best_pair is None or best_times is None or best_lags is None or best_correlations is None:
         raise RuntimeError('No usable recorded/WAV channel pair could be evaluated.')
-    best_pair = max(pair_results, key=lambda pair: pair_results[pair]['median_corr'])
     best_recorded_index, best_wav_index = best_pair
 
-    candidate_times: list[float] = []
-    candidate_lags: list[float] = []
-    candidate_correlations: list[float] = []
-    for center in centers:
-        lag, correlation = _estimate_window_lag(
-            recorded_sync[best_recorded_index],
-            wav_sync[best_wav_index],
-            center_s=float(center),
-            sfreq=sync_sfreq,
-            window_s=window_s,
-            max_lag_s=max_lag_s,
-        )
-        if lag is not None and correlation is not None and np.isfinite(correlation):
-            candidate_times.append(float(center))
-            candidate_lags.append(lag)
-            candidate_correlations.append(correlation)
-
-    candidate_times_array = np.asarray(candidate_times, dtype=float)
-    candidate_lags_array = np.asarray(candidate_lags, dtype=float)
-    candidate_correlations_array = np.asarray(candidate_correlations, dtype=float)
-    accepted = candidate_correlations_array >= min_corr
-    anchor_times = candidate_times_array[accepted]
-    anchor_lags = candidate_lags_array[accepted]
-    anchor_correlations = candidate_correlations_array[accepted]
+    accepted = best_correlations >= min_corr
+    anchor_times = best_times[accepted]
+    anchor_lags = best_lags[accepted]
+    anchor_correlations = best_correlations[accepted]
     if len(anchor_times) < min_anchors:
         raise RuntimeError(
             f'Only {len(anchor_times)} synchronization anchors were accepted; required {min_anchors}. '
-            f'Best median correlation: {pair_results[best_pair]["median_corr"]:.3f}.'
+            f'Best median correlation: {best_score:.3f}.'
         )
 
     initial_drift, initial_offset, _, _ = theilslopes(anchor_lags, anchor_times)
@@ -337,9 +360,7 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
 
     alignment: dict[str, Any] = {
         'offset_s': float(offset),
-        'drift_fraction': float(drift),
         'clock_slope': float(clock_slope),
-        'resample_sfreq': float(raw_sfreq / clock_slope),
         'raw_sfreq': raw_sfreq,
         'wav_sfreq': wav_sfreq,
         'wav_duration_s': float(wav_duration_s),
@@ -347,106 +368,32 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
         'total_drift_ms': float(drift * wav_duration_s * 1000),
         'residual_rms_ms': float(np.sqrt(np.mean(residuals[inliers] ** 2)) * 1000),
         'residual_max_ms': float(np.max(np.abs(residuals[inliers])) * 1000),
+        'median_correlation': float(np.median(anchor_correlations[inliers])),
+        'n_anchors': len(anchor_times),
+        'n_anchor_inliers': int(np.sum(inliers)),
         'selected_recorded_channel': audio_channels[best_recorded_index],
         'selected_wav_channel': int(best_wav_index),
-        'candidate_times_s': candidate_times_array,
-        'candidate_lags_s': candidate_lags_array,
-        'candidate_corrs': candidate_correlations_array,
-        'anchor_times_s': anchor_times,
-        'anchor_lags_s': anchor_lags,
-        'anchor_corrs': anchor_correlations,
-        'anchor_inliers': inliers,
-        'outlier_threshold_s': outlier_threshold_s,
     }
 
     if verbose:
-        print(
-            f'Alignment {Path(wav_file).name}: offset={offset * 1000:+.3f} ms, '
+        mne.utils.logger.info(
+            f'Alignment {wav_path.name}: offset={offset * 1000:+.3f} ms, '
             f'drift={drift * 1e6:+.3f} us/s, residual RMS={alignment["residual_rms_ms"]:.3f} ms'
         )
     return alignment
 
 
-def _warp_annotations(
-    raw: mne.io.BaseRaw,
-    *,
-    source_start_sample: int,
-    source_stop_sample: int,
-    clock_slope: float,
-    output_duration_s: float,
-) -> mne.Annotations:
-    """Crop and clock-warp annotations into an aligned trial's time base."""
-    annotations = raw.annotations
-    if len(annotations) == 0:
-        return mne.Annotations([], [], [])
-
-    starts = raw.time_as_index(
-        annotations.onset,
-        use_rounding=True,
-        origin=annotations.orig_time,
-    )
-    stops = raw.time_as_index(
-        annotations.onset + annotations.duration,
-        use_rounding=True,
-        origin=annotations.orig_time,
-    )
-    if annotations.orig_time is not None:
-        starts += raw.first_samp
-        stops += raw.first_samp
-
-    sfreq = float(raw.info['sfreq'])
-    output_onsets: list[float] = []
-    output_durations: list[float] = []
-    output_descriptions: list[str] = []
-    output_ch_names: list[tuple[str, ...]] = []
-
-    for index, (annotation_start, annotation_stop) in enumerate(zip(starts, stops, strict=True)):
-        start = int(annotation_start)
-        stop = int(annotation_stop)
-        is_point = stop == start
-        if is_point:
-            if not source_start_sample <= start < source_stop_sample:
-                continue
-            mapped_onset = (start - source_start_sample) / (sfreq * clock_slope)
-            if not 0 <= mapped_onset < output_duration_s:
-                continue
-            mapped_duration = 0.0
-        else:
-            overlap_start = max(start, source_start_sample)
-            overlap_stop = min(stop, source_stop_sample)
-            if overlap_stop <= overlap_start:
-                continue
-            mapped_onset = (overlap_start - source_start_sample) / (sfreq * clock_slope)
-            mapped_stop = (overlap_stop - source_start_sample) / (sfreq * clock_slope)
-            mapped_onset = max(0.0, mapped_onset)
-            mapped_stop = min(output_duration_s, mapped_stop)
-            if mapped_stop <= mapped_onset:
-                continue
-            mapped_duration = mapped_stop - mapped_onset
-
-        output_onsets.append(float(mapped_onset))
-        output_durations.append(float(mapped_duration))
-        output_descriptions.append(str(annotations.description[index]))
-        output_ch_names.append(tuple(annotations.ch_names[index]))
-
-    return mne.Annotations(
-        output_onsets,
-        output_durations,
-        output_descriptions,
-        orig_time=None,
-        ch_names=output_ch_names,
-    )
-
-
-def apply_raw_wav_alignment(
+def apply_raw_wav_alignment(  # noqa: C901
     raw: mne.io.BaseRaw,
     onset_sample: int,
     alignment: Mapping[str, Any],
     *,
     preserve_annotations: bool = True,
     verbose: bool = True,
-) -> tuple[mne.io.RawArray, dict[str, Any]]:
-    """Extract and clock-correct one trial from a continuous Raw object."""
+) -> mne.io.BaseRaw:
+    """Extract and clock-correct one trial using MNE's device realignment."""
+    if not isinstance(raw, mne.io.BaseRaw):
+        raise TypeError('raw must be an MNE Raw object.')
     raw_sfreq = float(raw.info['sfreq'])
     expected_sfreq = float(alignment['raw_sfreq'])
     if not np.isclose(raw_sfreq, expected_sfreq):
@@ -459,8 +406,12 @@ def apply_raw_wav_alignment(
 
     offset_s = float(alignment['offset_s'])
     clock_slope = float(alignment['clock_slope'])
-    resample_sfreq = float(alignment['resample_sfreq'])
     wav_duration_s = float(alignment['wav_duration_s'])
+    if not np.isfinite(offset_s) or not np.isfinite(clock_slope) or not np.isfinite(wav_duration_s):
+        raise ValueError('Alignment offset, clock slope, and WAV duration must be finite.')
+    if clock_slope <= 0 or wav_duration_s <= 0:
+        raise ValueError('Alignment clock slope and WAV duration must be positive.')
+
     source_start_float = onset_index + offset_s * raw_sfreq
     source_end_float = onset_index + (offset_s + clock_slope * wav_duration_s) * raw_sfreq
     if source_start_float < 0:
@@ -470,62 +421,53 @@ def apply_raw_wav_alignment(
             f'Required trial extends {(source_end_float - raw.n_times) / raw_sfreq:.6f} s beyond the Raw object.'
         )
 
-    source_start_index = int(round(source_start_float))
+    source_start_index = int(np.floor(source_start_float))
     source_end_index = min(int(np.ceil(source_end_float)) + 4, raw.n_times)
     segment = raw.copy().crop(
         tmin=source_start_index / raw_sfreq,
         tmax=(source_end_index - 1) / raw_sfreq,
     )
     segment.load_data()
-    n_before_resample = segment.n_times
-    segment.resample(sfreq=resample_sfreq, npad='auto')
-    n_after_resample = segment.n_times
-
     target_n_samples = int(round(wav_duration_s * raw_sfreq))
-    if segment.n_times < target_n_samples:
+    if target_n_samples < MIN_ANCHORS_FOR_DRIFT:
+        raise RuntimeError('WAV duration is too short to construct an aligned Raw object.')
+    reference = mne.io.RawArray(
+        np.zeros((1, target_n_samples)),
+        mne.create_info(['WAV reference'], raw_sfreq, ['misc']),
+        verbose=False,
+    )
+    if not preserve_annotations:
+        segment.set_annotations(mne.Annotations([], [], []))
+
+    # realign_raw expects shared times relative to the starts of its two Raw
+    # objects. Supplying points on the fitted line delegates cropping,
+    # resampling, and annotation correction to MNE without fitting the noisy
+    # cross-correlation anchors a second time.
+    wav_times = np.linspace(0.0, reference.times[-1], 20)
+    trigger_time_in_segment = (onset_index - source_start_index) / raw_sfreq
+    recorded_times = trigger_time_in_segment + offset_s + clock_slope * wav_times
+
+    # MNE 1.8 resolves each channel name as a string pick while checking for
+    # NaNs. Names such as ``audio`` or ``eeg`` are ambiguous with channel-type
+    # selectors, so use collision-free temporary names during realignment.
+    original_names = list(segment.ch_names)
+    temporary_names = [f'AKALIGN{index:04d}' for index in range(len(original_names))]
+    while set(temporary_names) & set(original_names):
+        temporary_names = [f'X{name}' for name in temporary_names]
+    rename_to_temporary = dict(zip(original_names, temporary_names, strict=True))
+    segment.rename_channels(rename_to_temporary)
+    try:
+        mne.preprocessing.realign_raw(
+            reference,
+            segment,
+            t_raw=wav_times,
+            t_other=recorded_times,
+            verbose=verbose,
+        )
+    finally:
+        segment.rename_channels({temporary: original for original, temporary in rename_to_temporary.items()})
+    if segment.n_times != target_n_samples:
         raise RuntimeError(
             f'Clock correction produced {segment.n_times} samples; {target_n_samples} samples are required.'
         )
-    corrected_data = segment.get_data(start=0, stop=target_n_samples)
-    aligned = mne.io.RawArray(corrected_data, raw.info.copy(), first_samp=0, verbose=False)
-
-    source_start_sample = raw.first_samp + source_start_index
-    logical_source_stop = min(
-        source_start_sample + int(np.ceil(target_n_samples * clock_slope)),
-        raw.first_samp + raw.n_times,
-    )
-    if preserve_annotations:
-        aligned.set_annotations(
-            _warp_annotations(
-                raw,
-                source_start_sample=source_start_sample,
-                source_stop_sample=logical_source_stop,
-                clock_slope=clock_slope,
-                output_duration_s=target_n_samples / raw_sfreq,
-            )
-        )
-
-    actual_source_start_s = (source_start_index - onset_index) / raw_sfreq
-    applied_info = {
-        'onset_sample': onset_sample,
-        'source_start_sample': source_start_sample,
-        'source_end_sample': raw.first_samp + source_end_index - 1,
-        'offset_s': offset_s,
-        'actual_source_start_relative_to_trigger_s': actual_source_start_s,
-        'source_start_rounding_error_s': actual_source_start_s - offset_s,
-        'clock_slope': clock_slope,
-        'resample_sfreq': resample_sfreq,
-        'wav_duration_s': wav_duration_s,
-        'n_samples_before_resample': n_before_resample,
-        'n_samples_after_resample': n_after_resample,
-        'target_n_samples': target_n_samples,
-        'n_samples_aligned': aligned.n_times,
-        'aligned_duration_s': aligned.n_times / raw_sfreq,
-        'n_annotations_preserved': len(aligned.annotations),
-    }
-    if verbose:
-        print(
-            f'Applied alignment: source={n_before_resample} samples, corrected={aligned.n_times} samples, '
-            f'output sfreq={aligned.info["sfreq"]:.6f} Hz'
-        )
-    return aligned, applied_info
+    return segment

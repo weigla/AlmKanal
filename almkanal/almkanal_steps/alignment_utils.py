@@ -10,7 +10,7 @@ import numpy as np
 from attrs import define
 
 from almkanal.almkanal import AlmKanalStep
-from almkanal.stim_utils.audio_alignment import (
+from almkanal.stim_utils.alignment_utils import (
     apply_raw_wav_alignment,
     estimate_raw_wav_alignment,
     find_audio_trials,
@@ -18,9 +18,7 @@ from almkanal.stim_utils.audio_alignment import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-OUTPUT_EVENT_WIDTH_SAMPLES = 2
+    from collections.abc import Mapping, Sequence
 
 
 @define
@@ -33,12 +31,14 @@ class AudioTrialRealignment(AlmKanalStep):
 
     The returned object is an MNE ``Raw`` containing all aligned trials in
     their original order. Corrected onset events are written back to the stim
-    channel, and each trial receives a descriptive annotation.
+    channel, and each trial receives a descriptive annotation. When an
+    ``Events`` step follows, set ``initial_event=True`` so an onset at the
+    first output sample is retained.
     """
 
     onset_trigger_to_wav: Mapping[int, str | Path]
-    end_triggers: int | tuple[int, ...]
-    audio_channels: tuple[str, ...]
+    end_triggers: int | Sequence[int]
+    audio_channels: Sequence[str]
     wav_root: str | Path | None = None
     stim_channel: str | None = None
     alignment_kwargs: Mapping[str, Any] | None = None
@@ -60,7 +60,7 @@ class AudioTrialRealignment(AlmKanalStep):
     def __attrs_post_init__(self) -> None:
         if not self.onset_trigger_to_wav:
             raise ValueError('onset_trigger_to_wav must contain at least one onset-trigger/WAV pair.')
-        if not self.audio_channels:
+        if isinstance(self.audio_channels, str) or not self.audio_channels:
             raise ValueError('audio_channels must contain at least one recorded audio channel.')
         if self.on_alignment_error not in {'raise', 'skip'}:
             raise ValueError("on_alignment_error must be either 'raise' or 'skip'.")
@@ -86,10 +86,8 @@ class AudioTrialRealignment(AlmKanalStep):
             raise RuntimeError('No complete audio trials were found.')
 
         sfreq = float(data.info['sfreq'])
-        aligned_trials: list[mne.io.RawArray] = []
-        events_per_trial: list[np.ndarray] = []
+        aligned_trials: list[mne.io.BaseRaw] = []
         trial_records: list[dict[str, Any]] = []
-        alignments: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         concatenated_start_sample = 0
         estimate_kwargs = dict(self.alignment_kwargs or {})
@@ -99,9 +97,6 @@ class AudioTrialRealignment(AlmKanalStep):
         for trial_index, trial in enumerate(trials):
             wav_file = self._resolve_wav_path(trial['wav_file'])
             try:
-                if not wav_file.is_file():
-                    raise FileNotFoundError(f'WAV file does not exist: {wav_file}')
-
                 trial_tmin = (trial['onset_sample'] - data.first_samp) / sfreq
                 trial_tmax = (trial['end_sample'] - data.first_samp) / sfreq
                 raw_trial = data.copy().crop(tmin=trial_tmin, tmax=trial_tmax)
@@ -110,14 +105,14 @@ class AudioTrialRealignment(AlmKanalStep):
                     wav_file,
                     **estimate_kwargs,
                 )
-                aligned, correction = apply_raw_wav_alignment(
+                aligned = apply_raw_wav_alignment(
                     data,
                     trial['onset_sample'],
                     alignment,
                     preserve_annotations=self.preserve_annotations,
                     verbose=self.verbose,
                 )
-            except (FileNotFoundError, RuntimeError, ValueError) as error:
+            except (OSError, RuntimeError, ValueError) as error:
                 failure = {
                     'trial_index': trial_index,
                     'onset_code': trial['onset_code'],
@@ -135,11 +130,9 @@ class AudioTrialRealignment(AlmKanalStep):
                 continue
 
             description = f'audio_trial/{trial_index:03d}/trigger={trial["onset_code"]}/wav={wav_file.name}'
-            aligned.annotations.append(0.0, 0.0, description)
-            local_event = np.array([[aligned.first_samp, 0, trial['onset_code']]], dtype=int)
-            events_per_trial.append(local_event)
+            aligned.annotations.append(aligned.first_time, 0.0, description)
 
-            stop_sample = concatenated_start_sample + aligned.n_times
+            stop_sample = concatenated_start_sample + int(aligned.n_times)
             trial_records.append(
                 {
                     'trial_index': trial_index,
@@ -151,61 +144,59 @@ class AudioTrialRealignment(AlmKanalStep):
                     'concatenated_start_sample': concatenated_start_sample,
                     'concatenated_stop_sample_exclusive': stop_sample,
                     'concatenated_start_s': concatenated_start_sample / sfreq,
-                    'duration_s': aligned.n_times / sfreq,
+                    'duration_s': float(aligned.n_times / sfreq),
                     'offset_s': alignment['offset_s'],
                     'clock_slope': alignment['clock_slope'],
                     'drift_us_per_s': alignment['drift_us_per_s'],
                     'residual_rms_ms': alignment['residual_rms_ms'],
-                    'residual_max_ms': alignment['residual_max_ms'],
-                    'n_anchor_inliers': int(np.sum(alignment['anchor_inliers'])),
-                    'n_annotations_preserved': correction['n_annotations_preserved'],
+                    'median_correlation': alignment['median_correlation'],
+                    'n_anchor_inliers': alignment['n_anchor_inliers'],
+                    'selected_recorded_channel': alignment['selected_recorded_channel'],
+                    'selected_wav_channel': alignment['selected_wav_channel'],
                 }
             )
-            alignments.append(alignment)
             concatenated_start_sample = stop_sample
             aligned_trials.append(aligned)
 
         if not aligned_trials:
             raise RuntimeError('No audio trials could be aligned successfully.')
 
-        concatenated, events = mne.concatenate_raws(
+        concatenated = mne.concatenate_raws(
             aligned_trials,
             preload=self.concat_preload,
-            events_list=events_per_trial,
             verbose=self.verbose,
         )
 
         # The original onset can precede WAV time zero and therefore be absent
         # from an aligned crop. Install one corrected event per trial so the
-        # standard AlmKanal Events -> Epochs path continues to work.
-        def install_corrected_events(stim_data: np.ndarray) -> np.ndarray:
-            corrected_stim = np.zeros_like(stim_data)
-            for sample, _, event_code in events:
-                local_sample = int(sample) - concatenated.first_samp
-                stop = min(local_sample + OUTPUT_EVENT_WIDTH_SAMPLES, concatenated.n_times)
-                corrected_stim[local_sample:stop] = int(event_code)
-            return corrected_stim
-
-        concatenated.apply_function(install_corrected_events, picks=[stim_channel])
+        # downstream Events -> Epochs path continues to work.
+        events = np.asarray(
+            [
+                [concatenated.first_samp + trial['concatenated_start_sample'], 0, trial['onset_code']]
+                for trial in trial_records
+            ],
+            dtype=int,
+        )
+        concatenated.add_events(events, stim_channel=stim_channel, replace=True)
 
         return {
             'data': concatenated,
             'realignment_info': {
                 'events': events,
                 'trials': trial_records,
-                'alignments': alignments,
                 'failures': failures,
                 'stim_channel': stim_channel,
                 'audio_channels': self.audio_channels,
                 'onset_trigger_to_wav': {str(code): str(path) for code, path in self.onset_trigger_to_wav.items()},
                 'end_triggers': self.end_triggers,
-                'alignment_kwargs': estimate_kwargs,
+                'alignment_kwargs': dict(self.alignment_kwargs or {}),
                 'n_trials_found': len(trials),
                 'n_trials_aligned': len(aligned_trials),
                 'n_trials_failed': len(failures),
-                'output_n_times': concatenated.n_times,
-                'output_duration_s': concatenated.n_times / sfreq,
+                'output_n_times': int(concatenated.n_times),
+                'output_duration_s': float(concatenated.n_times / sfreq),
                 'preserve_annotations': self.preserve_annotations,
+                'on_alignment_error': self.on_alignment_error,
             },
         }
 
@@ -221,13 +212,14 @@ class AudioTrialRealignment(AlmKanalStep):
                 f'<td>{trial["duration_s"]:.3f}</td>'
                 f'<td>{trial["offset_s"] * 1000:.3f}</td>'
                 f'<td>{trial["drift_us_per_s"]:.3f}</td>'
+                f'<td>{trial["median_correlation"]:.3f}</td>'
                 f'<td>{trial["residual_rms_ms"]:.3f}</td>'
                 '</tr>'
             )
         table = (
             '<table><thead><tr><th>Trial</th><th>Trigger</th><th>WAV</th>'
             '<th>Duration (s)</th><th>Offset (ms)</th><th>Drift (us/s)</th>'
-            '<th>Residual RMS (ms)</th></tr></thead><tbody>'
+            '<th>Median r</th><th>Residual RMS (ms)</th></tr></thead><tbody>'
             + ''.join(rows) +
             '</tbody></table>'
         )
