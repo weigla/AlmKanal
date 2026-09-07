@@ -2,7 +2,6 @@
 
 from almkanal.__version__ import __version__
 from almkanal.almkanal import AlmKanal, AlmKanalStep
-from almkanal.almkanal_steps.alignment_utils import AudioTrialRealignment
 from almkanal.almkanal_steps.bio_utils import PhysioCleaner
 from almkanal.almkanal_steps.channel_utils import RANSAC, Maxwell, MultiBlockMaxwell, ReReference
 from almkanal.almkanal_steps.epoch_utils import Epochs
@@ -12,13 +11,12 @@ from almkanal.almkanal_steps.headmodel_utils import ForwardModel
 from almkanal.almkanal_steps.ica_utils import ICA
 from almkanal.almkanal_steps.spatial_filter_utils import SpatialFilter
 from almkanal.almkanal_steps.src_recon_utils import SourceReconstruction
-from almkanal.almkanal_steps.trf_utils import EpochTRF
+from almkanal.almkanal_steps.trf_utils import EpochTRF, TRFSpanSpec
 from almkanal.report.exporting import preprocessing_report
 
 __all__ = [
     'AlmKanal',
     'AlmKanalStep',
-    'AudioTrialRealignment',
     'Filter',
     'Resample',
     'Maxwell',
@@ -30,6 +28,7 @@ __all__ = [
     'Events',
     'Epochs',
     'EpochTRF',
+    'TRFSpanSpec',
     'ForwardModel',
     'SpatialFilter',
     'SourceReconstruction',

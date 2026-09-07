@@ -9,8 +9,7 @@ import pytest
 from scipy.io import wavfile
 from scipy.signal import butter, hilbert, sosfiltfilt
 
-from almkanal import AudioTrialRealignment
-from almkanal.report.stepspecs.registry import get_registry, load_stepspec_package
+from almkanal import AlmKanal, EpochTRF, TRFSpanSpec, preprocessing_report
 from almkanal.stim_utils.alignment_utils import (
     apply_raw_wav_alignment,
     estimate_raw_wav_alignment,
@@ -150,46 +149,57 @@ def test_estimation_and_application_correct_known_drift(synthetic_audio_alignmen
     assert np.corrcoef(recorded_envelope, wav_envelope)[0, 1] > 0.75
 
 
-def test_audio_trial_realignment_step_writes_corrected_event(
+def test_epoch_trf_realigns_audio_and_records_diagnostics(
     synthetic_audio_alignment: dict[str, Any],
+    tmp_path: Path,
 ) -> None:
     wav_path = synthetic_audio_alignment['wav_path']
-    step = AudioTrialRealignment(
-        onset_trigger_to_wav={11: wav_path.name},
-        end_triggers=99,
+    step = EpochTRF(
+        gen_span_spec=lambda raw: TRFSpanSpec.from_events(raw, {11: wav_path.name}, 99, stim_channel='stim'),
+        base_audio_path=wav_path.parent,
         audio_channels=['MISC flat', 'audio'],
-        wav_root=wav_path.parent,
-        stim_channel='stim',
         alignment_kwargs=ALIGNMENT_KWARGS,
+        epoch_len_s=1.0,
+        hw_delay_s=-0.0165,
         verbose=False,
     )
+    raw = synthetic_audio_alignment['raw']
+    original = raw.get_data().copy()
+    pipeline = AlmKanal(steps=[step])
+    epochs, report = pipeline.run(raw)
+    trf_info = pipeline.info['steps_info']['EpochTRF']['TRF_info']
+    alignment = trf_info['alignment_info']
 
-    result = step.run(synthetic_audio_alignment['raw'], {})
-    aligned = result['data']
-    events = mne.find_events(
-        aligned,
-        stim_channel='stim',
-        shortest_event=1,
-        initial_event=True,
-        verbose=False,
+    assert len(epochs) == 8
+    assert epochs.get_data().shape[-1] == 500
+    assert 'env_rms' in epochs.ch_names
+    assert alignment['n_trials_aligned'] == 1
+    assert alignment['n_trials_failed'] == 0
+    assert alignment['trials'][0]['drift_us_per_s'] == pytest.approx(1500, abs=300)
+    assert alignment['summary']['offset_ms']['mean'] == pytest.approx(40, abs=2)
+    assert trf_info['hw_delay_s'] == -0.0165
+    assert trf_info['applied_hw_delay_s'] == -0.016
+    assert trf_info['alignment_kwargs']['min_anchors'] == 6
+    assert epochs.metadata['stimulus'].unique().tolist() == ['stimulus']
+    np.testing.assert_array_equal(raw.get_data(), original)
+
+    assert 'TRF audio realignment' in report.get_contents()[0]
+    json_path = tmp_path / 'pipeline.json'
+    pipeline.generate_json(str(json_path))
+    methods = preprocessing_report([json_path], tmp_path / 'methods.md').read_text()
+    assert '1 of 1 trials were successfully aligned' in methods
+    assert 'physical delay of -16.500 ms was applied after realignment' in methods
+    assert f"signed clock drift {alignment['trials'][0]['drift_us_per_s']:.3f}" in methods
+
+
+def test_span_spec_preserves_repeated_wavs_and_event_order() -> None:
+    stim = np.zeros(30)
+    stim[[0, 10, 20]] = [11, 12, 11]
+    stim[[8, 18, 28]] = 99
+    raw = mne.io.RawArray(
+        stim[None], mne.create_info(['trigger'], 100.0, ['stim']), first_samp=100, verbose=False,
     )
-
-    assert events.tolist() == [[aligned.first_samp, 0, 11]]
-    assert result['realignment_info']['n_trials_aligned'] == 1
-    assert 'alignments' not in result['realignment_info']
-    assert any(description.startswith('audio_trial/000/') for description in aligned.annotations.description)
-
-
-def test_alignment_stepspec_only_compares_configuration() -> None:
-    load_stepspec_package('almkanal.report.stepspecs')
-    settings = get_registry()['AudioTrialRealignment'].settings_fn(
-        {
-            'stim_channel': 'stim',
-            'audio_channels': ['audio'],
-            'n_trials_found': 4,
-            'n_trials_aligned': 3,
-            'output_duration_s': 24.0,
-        }
-    )
-
-    assert settings == {'stim_channel': 'stim', 'audio_channels': ['audio']}
+    spec = TRFSpanSpec.from_events(raw, {11: 'same.wav', 12: 'other.wav'}, 99)
+    assert list(spec.spans_by_label.values()) == [(100, 108), (110, 118), (120, 128)]
+    assert list(spec.wav_by_label.values()) == ['same.wav', 'other.wav', 'same.wav']
+    assert [meta['onset_code'] for meta in spec.metadata_by_label.values()] == [11, 12, 11]

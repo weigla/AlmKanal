@@ -284,10 +284,13 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     if not wav_sync:
         raise RuntimeError('None of the WAV channels contains a usable signal.')
 
-    usable_duration = min(
-        max(len(envelope) for _, envelope in recorded_sync),
-        max(len(envelope) for _, envelope in wav_sync),
-    ) / sync_sfreq
+    usable_duration = (
+        min(
+            max(len(envelope) for _, envelope in recorded_sync),
+            max(len(envelope) for _, envelope in wav_sync),
+        )
+        / sync_sfreq
+    )
     first_center = window_s / 2 + max_lag_s
     last_center = usable_duration - window_s / 2 - max_lag_s
     if last_center < first_center:
@@ -383,15 +386,21 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     return alignment
 
 
-def apply_raw_wav_alignment(  # noqa: C901
+def apply_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     raw: mne.io.BaseRaw,
     onset_sample: int,
     alignment: Mapping[str, Any],
     *,
     preserve_annotations: bool = True,
+    padding_s: tuple[float, float] = (0.0, 0.0),
     verbose: bool = True,
 ) -> mne.io.BaseRaw:
-    """Extract and clock-correct one trial using MNE's device realignment."""
+    """Extract and clock-correct one trial using MNE's device realignment.
+
+    ``padding_s`` retains real recording data before/after the WAV, measured
+    on the corrected WAV clock. This permits subsequent physical-delay
+    correction without discarding trial endpoints or adding synthetic data.
+    """
     if not isinstance(raw, mne.io.BaseRaw):
         raise TypeError('raw must be an MNE Raw object.')
     raw_sfreq = float(raw.info['sfreq'])
@@ -412,8 +421,13 @@ def apply_raw_wav_alignment(  # noqa: C901
     if clock_slope <= 0 or wav_duration_s <= 0:
         raise ValueError('Alignment clock slope and WAV duration must be positive.')
 
-    source_start_float = onset_index + offset_s * raw_sfreq
-    source_end_float = onset_index + (offset_s + clock_slope * wav_duration_s) * raw_sfreq
+    if np.shape(padding_s) != (2,) or any(not np.isfinite(pad) or pad < 0 for pad in padding_s):
+        raise ValueError('padding_s must contain two finite, non-negative durations.')
+    pad_before, pad_after = (int(round(pad * raw_sfreq)) for pad in padding_s)
+    wav_start_s = -pad_before / raw_sfreq
+    wav_stop_s = wav_duration_s + pad_after / raw_sfreq
+    source_start_float = onset_index + (offset_s + clock_slope * wav_start_s) * raw_sfreq
+    source_end_float = onset_index + (offset_s + clock_slope * wav_stop_s) * raw_sfreq
     if source_start_float < 0:
         raise RuntimeError(f'Required trial begins {-source_start_float / raw_sfreq:.6f} s before the Raw object.')
     if source_end_float > raw.n_times:
@@ -428,7 +442,7 @@ def apply_raw_wav_alignment(  # noqa: C901
         tmax=(source_end_index - 1) / raw_sfreq,
     )
     segment.load_data()
-    target_n_samples = int(round(wav_duration_s * raw_sfreq))
+    target_n_samples = int(round(wav_duration_s * raw_sfreq)) + pad_before + pad_after
     if target_n_samples < MIN_ANCHORS_FOR_DRIFT:
         raise RuntimeError('WAV duration is too short to construct an aligned Raw object.')
     reference = mne.io.RawArray(
@@ -443,7 +457,8 @@ def apply_raw_wav_alignment(  # noqa: C901
     # objects. Supplying points on the fitted line delegates cropping,
     # resampling, and annotation correction to MNE without fitting the noisy
     # cross-correlation anchors a second time.
-    wav_times = np.linspace(0.0, reference.times[-1], 20)
+    reference_times = np.linspace(0.0, reference.times[-1], 20)
+    wav_times = reference_times + wav_start_s
     trigger_time_in_segment = (onset_index - source_start_index) / raw_sfreq
     recorded_times = trigger_time_in_segment + offset_s + clock_slope * wav_times
 
@@ -460,7 +475,7 @@ def apply_raw_wav_alignment(  # noqa: C901
         mne.preprocessing.realign_raw(
             reference,
             segment,
-            t_raw=wav_times,
+            t_raw=reference_times,
             t_other=recorded_times,
             verbose=verbose,
         )
@@ -471,3 +486,33 @@ def apply_raw_wav_alignment(  # noqa: C901
             f'Clock correction produced {segment.n_times} samples; {target_n_samples} samples are required.'
         )
     return segment
+
+
+def summarize_alignments(trials: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, float | int]]:
+    """Store complete trial statistics even when JSON export truncates trial lists.
+
+    SD uses the population convention (ddof=0). Counts and moments permit
+    exact pooling across recordings with different numbers of trials.
+    """
+    metrics = {
+        'offset_ms': ('offset_s', 1000.0),
+        'clock_slope': ('clock_slope', 1.0),
+        'drift_us_per_s': ('drift_us_per_s', 1.0),
+        'total_drift_ms': ('total_drift_ms', 1.0),
+        'residual_rms_ms': ('residual_rms_ms', 1.0),
+        'residual_max_ms': ('residual_max_ms', 1.0),
+        'median_correlation': ('median_correlation', 1.0),
+        'n_anchor_inliers': ('n_anchor_inliers', 1.0),
+    }
+    summary = {}
+    for name, (key, scale) in metrics.items():
+        values = np.asarray([float(trial[key]) * scale for trial in trials], dtype=float)
+        if values.size:
+            summary[name] = {
+                'n': int(values.size),
+                'mean': float(np.mean(values)),
+                'sd': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+            }
+    return summary
