@@ -135,8 +135,9 @@ def _aligned_segment(
         verbose=verbose,
     )
     # Apply the physical delay only AFTER correcting the recording clock.
-    # Positive delays select later neural samples; negative delays select earlier
-    # ones. The WAV features stay at their original time zero.
+    # output_neural(t) = aligned_neural(t + hw_delay_s): selecting later
+    # samples advances neural events. The default +0.0165 compensates the
+    # playback-to-ear delay in the air tubes. WAV features are attached afterward.
     start = before + delay_samples
     n_samples = int(round(alignment['wav_duration_s'] * sfreq))
     aligned.crop(tmin=start / sfreq, tmax=(start + n_samples - 1) / sfreq)
@@ -150,7 +151,7 @@ def _build_trf_epochs(  # noqa: C901, PLR0915, PLR0912
     *,
     feature: str = 'envelope',
     audio_cutoff_hz: float = 80.0,
-    hw_delay_s: float = -0.0165,
+    hw_delay_s: float = 0.0165,
     epoch_len_s: float = 5.0,
     wav_ext: str = '.wav',
     audio_channels: Sequence[str] | None = None,
@@ -169,6 +170,15 @@ def _build_trf_epochs(  # noqa: C901, PLR0915, PLR0912
         raise ValueError('alignment_kwargs requires audio_channels to enable realignment.')
     if on_alignment_error not in {'raise', 'skip'}:
         raise ValueError("on_alignment_error must be either 'raise' or 'skip'.")
+    if hw_delay_s < 0:
+        warnings.warn(
+            'Negative hw_delay_s delays MEG/EEG relative to the unchanged WAV feature channels. '
+            'This adds to a playback-to-ear delay instead of compensating it. The default '
+            '+0.0165 s advances neural events to compensate the 16.5 ms air-tube delay. '
+            'Check the sign of your physical-delay correction.',
+            UserWarning,
+            stacklevel=3,
+        )
     sfreq = float(raw.info['sfreq'])
     first = int(raw.first_samp)
     delay_samples = int(round(hw_delay_s * sfreq))
@@ -324,7 +334,7 @@ def build_trf_epochs(
     *,
     feature: str = 'envelope',
     audio_cutoff_hz: float = 80.0,
-    hw_delay_s: float = -0.0165,
+    hw_delay_s: float = 0.0165,
     epoch_len_s: float = 5.0,
     wav_ext: str = '.wav',
     audio_channels: Sequence[str] | None = None,
@@ -338,6 +348,10 @@ def build_trf_epochs(
     Supplying audio_channels enables per-trial offset and drift estimation.
     hw_delay_s always shifts neural data relative to WAV features, after any
     realignment, rounded to the nearest sample on the corrected clock.
+    Positive values advance neural events; the default +0.0165 s compensates
+    the 16.5 ms playback-to-ear delay when the audio reference precedes the
+    air tubes. Negative values add lag and emit a warning. The added WAV
+    feature channels are never delay-shifted.
     """
     epochs, _ = _build_trf_epochs(
         raw,
@@ -363,8 +377,13 @@ class EpochTRF(AlmKanalStep):
 
     audio_channels=None retains fixed-delay-only processing. Otherwise, recorded
     audio channels must still be present with sufficient bandwidth for alignment.
-    Each trial is first corrected to WAV time, then hw_delay_s is applied:
-    positive values select later neural data and negative values earlier data.
+    Each trial is first corrected to WAV time, then hw_delay_s is applied to
+    neural data before attaching the unchanged WAV feature channels. Positive
+    values advance neural events relative to those features; the default
+    +0.0165 s compensates the 16.5 ms playback-to-ear delay when the audio
+    reference precedes the air tubes, preserving the brain's response latency.
+    Use zero if the reference already captures sound arrival at the ears.
+    Negative values add lag and emit a warning for this sign convention.
     Physical delays are rounded to the nearest sample on the corrected clock.
     Realignment retains recording margins to preserve the full WAV duration;
     insufficient recording coverage is an alignment error.
@@ -374,7 +393,7 @@ class EpochTRF(AlmKanalStep):
     base_audio_path: str | Path
     feature: str = 'envelope'
     audio_cutoff_hz: float = 80.0
-    hw_delay_s: float = -0.0165
+    hw_delay_s: float = 0.0165
     epoch_len_s: float = 5.0
     audio_channels: Sequence[str] | None = None
     alignment_kwargs: Mapping[str, Any] | None = None
@@ -447,9 +466,11 @@ class EpochTRF(AlmKanalStep):
             table = pd.DataFrame(alignment['trials']).reindex(columns=list(columns)).rename(columns=columns)
             html = (
                 f'<p>Aligned {alignment["n_trials_aligned"]} of {alignment["n_trials_found"]} trials; '
-                f'{alignment["n_trials_failed"]} failed. Physical delay applied after realignment: '
+                f'{alignment["n_trials_failed"]} failed. Physical-delay correction after realignment: '
                 f'{trf_info["applied_hw_delay_s"] * 1000:g} ms '
-                f'(requested {self.hw_delay_s * 1000:g} ms).</p>'
+                f'(requested {self.hw_delay_s * 1000:g} ms). '
+                'WAV feature channels were left unchanged; positive values advance neural events '
+                'to compensate playback-to-ear delay, and negative values add lag.</p>'
                 + table.to_html(index=False, escape=True, float_format=lambda value: f'{value:.6g}')
             )
             if alignment['failures']:

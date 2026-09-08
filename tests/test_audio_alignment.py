@@ -160,7 +160,6 @@ def test_epoch_trf_realigns_audio_and_records_diagnostics(
         audio_channels=['MISC flat', 'audio'],
         alignment_kwargs=ALIGNMENT_KWARGS,
         epoch_len_s=1.0,
-        hw_delay_s=-0.0165,
         verbose=False,
     )
     raw = synthetic_audio_alignment['raw']
@@ -177,8 +176,8 @@ def test_epoch_trf_realigns_audio_and_records_diagnostics(
     assert alignment['n_trials_failed'] == 0
     assert alignment['trials'][0]['drift_us_per_s'] == pytest.approx(1500, abs=300)
     assert alignment['summary']['offset_ms']['mean'] == pytest.approx(40, abs=2)
-    assert trf_info['hw_delay_s'] == -0.0165
-    assert trf_info['applied_hw_delay_s'] == -0.016
+    assert trf_info['hw_delay_s'] == 0.0165
+    assert trf_info['applied_hw_delay_s'] == 0.016
     assert trf_info['alignment_kwargs']['min_anchors'] == 6
     assert epochs.metadata['stimulus'].unique().tolist() == ['stimulus']
     np.testing.assert_array_equal(raw.get_data(), original)
@@ -188,7 +187,7 @@ def test_epoch_trf_realigns_audio_and_records_diagnostics(
     pipeline.generate_json(str(json_path))
     methods = preprocessing_report([json_path], tmp_path / 'methods.md').read_text()
     assert '1 of 1 trials were successfully aligned' in methods
-    assert 'physical delay of -16.500 ms was applied after realignment' in methods
+    assert 'physical-delay correction of 16.500 ms was applied after realignment' in methods
     assert f"signed clock drift {alignment['trials'][0]['drift_us_per_s']:.3f}" in methods
 
 

@@ -19,7 +19,7 @@
   {% endif %}
 {% endif %}
 {% if s.settings.hw_delay_s is defined %}
-  {% do lines.append('A separate physical delay of ' ~ '%.3f'|format(s.settings.hw_delay_s * 1000) ~ ' ms was applied' ~ (' after realignment' if s.settings.get('realign_audio', false) else '') ~ '; positive values select later neural samples relative to WAV features, and negative values select earlier samples.') %}
+  {% do lines.append('A physical-delay correction of ' ~ '%.3f'|format(s.settings.hw_delay_s * 1000) ~ ' ms was applied' ~ (' after realignment' if s.settings.get('realign_audio', false) else '') ~ '; positive values advance neural events relative to the WAV features to compensate playback-to-ear delay, and negative values add lag. The WAV feature channels were left unchanged.') %}
   {% if s.settings.applied_hw_delay_s is defined %}
     {% do lines.append('The delay rounded to the sampling grid was ' ~ '%.3f'|format(s.settings.applied_hw_delay_s * 1000) ~ ' ms.') %}
   {% endif %}

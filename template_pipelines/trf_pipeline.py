@@ -16,7 +16,7 @@ class TRFPipe(Job):
         subject_id: str,
         data_path: str,
         audio_path: str,
-        hw_delay_s: float = -0.0165,
+        hw_delay_s: float = 0.0165,
         epoch_len_s: float = 5.0,
     ) -> None:
         full_path = Path(data_path) / f'{subject_id}_raw.fif'
@@ -53,7 +53,9 @@ class TRFPipe(Job):
                     base_audio_path=audio_path,
                     audio_channels=['AUDIO001'],
                     alignment_kwargs={'window_s': 10.0, 'step_s': 5.0, 'min_corr': 0.3},
-                    # Realign first, then apply the separate physical delay.
+                    # Realign first, then apply the physical delay. The default
+                    # +0.0165 advances MEG to compensate the 16.5 ms air-tube
+                    # delay; the subsequently added WAV feature is not shifted.
                     hw_delay_s=hw_delay_s,
                     epoch_len_s=epoch_len_s,
                     on_alignment_error='raise',

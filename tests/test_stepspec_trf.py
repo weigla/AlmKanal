@@ -20,7 +20,7 @@ def make_info(drifts: list[float], failures: int = 0) -> dict:
     } for drift in drifts]
     return {
         'epoch_len_s': 1.0, 'feature': 'envelope', 'audio_cutoff_hz': 80,
-        'hw_delay_s': -0.0165, 'applied_hw_delay_s': -0.016,
+        'hw_delay_s': 0.0165, 'applied_hw_delay_s': 0.016,
         'realign_audio': True, 'audio_channels': ['recorded'],
         'alignment_kwargs': {
             'sync_sfreq': 500, 'window_s': 10, 'step_s': 5, 'max_lag_s': 0.25,
@@ -69,8 +69,10 @@ def test_preprocessing_report_pools_all_trials_after_json_truncation(tmp_path: P
     assert '2 failed and were skipped' in output
     assert f'{np.mean(first + second):.3f} ± {np.std(first + second):.3f} µs/s' in output
     assert 'residual RMS timing error 0.200 ± 0.000 ms' in output
-    assert 'physical delay of -16.500 ms was applied after realignment' in output
-    assert 'sampling grid was -16.000 ms' in output
+    assert 'physical-delay correction of 16.500 ms was applied after realignment' in output
+    assert 'positive values advance neural events relative to the WAV features to compensate playback-to-ear delay' in output
+    assert 'The WAV feature channels were left unchanged.' in output
+    assert 'sampling grid was 16.000 ms' in output
 
 
 def test_report_checks_configuration_but_allows_different_results(tmp_path: Path) -> None:
