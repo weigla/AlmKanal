@@ -212,7 +212,7 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     *,
     audio_channels: Sequence[str],
     sync_sfreq: float = 500.0,
-    audio_band: tuple[float, float] = (80.0, 2000.0),
+    audio_band: tuple[float, float] = (80.0, 400.0),
     envelope_lowpass: float = 30.0,
     window_s: float = 10.0,
     step_s: float = 5.0,
