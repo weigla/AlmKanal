@@ -18,6 +18,8 @@ class TRFPipe(Job):
         audio_path: str,
         hw_delay_s: float = 0.0165,
         epoch_len_s: float = 5.0,
+        infer_missing_ends: bool = False,
+        fallback_drift_us_per_s: float = 499.0,
     ) -> None:
         full_path = Path(data_path) / f'{subject_id}_raw.fif'
         raw = mne.io.read_raw(full_path, preload=True)
@@ -41,8 +43,13 @@ class TRFPipe(Job):
             return TRFSpanSpec.from_events(
                 raw,
                 onset_trigger_to_wav=onset_trigger_to_wav,
-                end_triggers=99,
+                end_triggers=99,  # Use None if the dataset has no end-trigger codes.
                 stim_channel='STI101',
+                # Enable for missing end triggers. WAV duration and the assumed
+                # drift define the span; cross-correlation still fits actual drift.
+                infer_missing_ends=infer_missing_ends,
+                base_audio_path=audio_path,
+                fallback_drift_us_per_s=fallback_drift_us_per_s,
             )
 
         ak = AlmKanal(
@@ -75,4 +82,5 @@ class TRFPipe(Job):
 # After all jobs finish, aggregate their JSON files into Methods text:
 # from almkanal import preprocessing_report
 # preprocessing_report(files, 'methods.md')
-# This includes drift/offset statistics and the subsequent physical delay.
+# This includes inferred-end counts/priors, measured drift/offset statistics,
+# and the subsequent physical delay.

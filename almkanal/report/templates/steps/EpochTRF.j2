@@ -1,4 +1,15 @@
 {% set lines = [] %}
+{% if s.results.get('n_trials_end_inferred', 0) %}
+  {% set priors = [] %}
+  {% for rate, count in s.results.end_inference_drift_counts.items() %}
+    {% do priors.append('%.3f'|format(rate|float) ~ ' µs/s for ' ~ count ~ (' trial' if count == 1 else ' trials')) %}
+  {% endfor %}
+  {% set n_inferred = s.results.n_trials_end_inferred %}
+  {% do lines.append('Trial endpoints were inferred for ' ~ n_inferred ~ (' trial' if n_inferred == 1 else ' trials') ~ ' without end triggers, using WAV duration multiplied by (1 + assumed signed drift / 1000000), with drift in µs/s (assumed rates: ' ~ priors|join('; ') ~ '). Existing end triggers were retained.') %}
+  {% if s.settings.get('realign_audio', false) %}
+    {% do lines.append('These assumed rates only defined the trial spans; the actual alignment offset and drift were subsequently estimated from the audio.') %}
+  {% endif %}
+{% endif %}
 {% if s.settings.get('realign_audio', false) %}
   {% set a = s.settings.alignment_kwargs %}
   {% do lines.append('Each audio trial was realigned to its reference WAV using normalized cross-correlation of recorded and reference audio envelopes and a linear model of onset offset and clock drift.') %}

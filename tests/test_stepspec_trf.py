@@ -99,3 +99,37 @@ def test_one_trial_summary_has_zero_sd(tmp_path: Path) -> None:
     path = write_pipeline_json(tmp_path / 'one.json', make_info([5.0]))
     metrics = build_context_from_files([path]).steps[0].results['metrics']
     assert metrics['drift_us_per_s'] == {'n': 1, 'mean': 5.0, 'sd': 0.0, 'min': 5.0, 'max': 5.0}
+
+
+def test_inference_counts_and_priors_survive_truncation_and_pool_separately(tmp_path: Path) -> None:
+    first = make_info([1500.0] * 75, failures=2)
+    second = make_info([1000.0])
+    # Include inferred trials whose subsequent audio alignment failed.
+    first['alignment_info'].update(n_trials_end_inferred=77, end_inference_drift_counts={'499.0': 77})
+    second['alignment_info'].update(n_trials_end_inferred=1, end_inference_drift_counts={'500.0': 1})
+    files = [
+        write_pipeline_json(tmp_path / 'first.json', first),
+        write_pipeline_json(tmp_path / 'second.json', second),
+        write_pipeline_json(tmp_path / 'complete.json', make_info([800.0])),
+    ]
+    exported = json.loads(files[0].read_text())['EpochTRF']['TRF_info']['alignment_info']
+    assert exported['trials'] == {'length': 75}
+    assert exported['end_inference_drift_counts'] == {'499.0': 77}
+    result = build_context_from_files(files).steps[0].results
+    assert result['n_trials_end_inferred'] == 78
+    assert result['end_inference_drift_counts'] == {'499.0': 77, '500.0': 1}
+    assert result['metrics']['drift_us_per_s']['mean'] == pytest.approx((75 * 1500 + 1000 + 800) / 77)
+    methods = preprocessing_report(files, tmp_path / 'methods.md').read_text()
+    assert 'Trial endpoints were inferred for 78 trials without end triggers' in methods
+    assert '499.000 µs/s for 77 trials; 500.000 µs/s for 1 trial' in methods
+
+
+def test_inferred_end_report_without_audio_alignment(tmp_path: Path) -> None:
+    info = {
+        'epoch_len_s': 5.0, 'realign_audio': False,
+        'alignment_info': {'n_trials_end_inferred': 1, 'end_inference_drift_counts': {'499.0': 1}},
+    }
+    path = write_pipeline_json(tmp_path / 'unaligned.json', info)
+    methods = preprocessing_report([path], tmp_path / 'methods.md').read_text()
+    assert 'Trial endpoints were inferred for 1 trial without end triggers' in methods
+    assert 'actual alignment offset and drift' not in methods

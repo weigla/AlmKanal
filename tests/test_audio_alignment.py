@@ -149,20 +149,27 @@ def test_estimation_and_application_correct_known_drift(synthetic_audio_alignmen
     assert np.corrcoef(recorded_envelope, wav_envelope)[0, 1] > 0.75
 
 
+@pytest.mark.parametrize('missing_end', [False, True])
 def test_epoch_trf_realigns_audio_and_records_diagnostics(
     synthetic_audio_alignment: dict[str, Any],
     tmp_path: Path,
+    missing_end: bool,
 ) -> None:
     wav_path = synthetic_audio_alignment['wav_path']
     step = EpochTRF(
-        gen_span_spec=lambda raw: TRFSpanSpec.from_events(raw, {11: wav_path.name}, 99, stim_channel='stim'),
+        gen_span_spec=lambda raw: TRFSpanSpec.from_events(
+            raw, {11: wav_path.name}, 99, stim_channel='stim',
+            infer_missing_ends=missing_end, base_audio_path=wav_path.parent,
+        ),
         base_audio_path=wav_path.parent,
         audio_channels=['MISC flat', 'audio'],
         alignment_kwargs=ALIGNMENT_KWARGS,
         epoch_len_s=1.0,
         verbose=False,
     )
-    raw = synthetic_audio_alignment['raw']
+    raw = synthetic_audio_alignment['raw'].copy()
+    if missing_end:
+        raw._data[-1, raw._data[-1] == 99] = 0
     original = raw.get_data().copy()
     pipeline = AlmKanal(steps=[step])
     epochs, report = pipeline.run(raw)
@@ -174,6 +181,7 @@ def test_epoch_trf_realigns_audio_and_records_diagnostics(
     assert 'env_rms' in epochs.ch_names
     assert alignment['n_trials_aligned'] == 1
     assert alignment['n_trials_failed'] == 0
+    assert alignment['n_trials_end_inferred'] == int(missing_end)
     assert alignment['trials'][0]['drift_us_per_s'] == pytest.approx(1500, abs=300)
     assert alignment['summary']['offset_ms']['mean'] == pytest.approx(40, abs=2)
     assert trf_info['hw_delay_s'] == 0.0165
@@ -189,6 +197,20 @@ def test_epoch_trf_realigns_audio_and_records_diagnostics(
     assert '1 of 1 trials were successfully aligned' in methods
     assert 'physical-delay correction of 16.500 ms was applied after realignment' in methods
     assert f"signed clock drift {alignment['trials'][0]['drift_us_per_s']:.3f}" in methods
+    if missing_end:
+        trial = alignment['trials'][0]
+        assert trial['original_end_sample'] is None
+        assert trial['inferred_end_sample'] == synthetic_audio_alignment['onset_sample'] + 4002
+        assert trial['end_inference_drift_us_per_s'] == 499
+        assert epochs.metadata['end_inferred'].all()
+        assert epochs.metadata['end_code'].isna().all()
+        assert epochs.metadata['end_inference_drift_us_per_s'].eq(499).all()
+        # The known synthetic drift is 1500 us/s: inference must not impose 499.
+        assert epochs.metadata['drift_us_per_s'].iloc[0] == pytest.approx(1500, abs=300)
+        assert 'Trial endpoints were inferred for 1 trial without end triggers' in methods
+        assert 'assumed rates: 499.000 µs/s for 1 trial' in methods
+        assert 'actual alignment offset and drift were subsequently estimated from the audio' in methods
+        assert '499.000 ± 0.000 µs/s' not in methods
 
 
 def test_span_spec_preserves_repeated_wavs_and_event_order() -> None:

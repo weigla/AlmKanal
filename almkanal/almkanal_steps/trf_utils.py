@@ -14,6 +14,7 @@ from attrs import define, field
 
 from almkanal.almkanal import AlmKanalStep
 from almkanal.stim_utils.alignment_utils import (
+    DEFAULT_FALLBACK_DRIFT_US_PER_S,
     apply_raw_wav_alignment,
     estimate_raw_wav_alignment,
     find_audio_trials,
@@ -80,12 +81,33 @@ class TRFSpanSpec:
         cls,
         raw: mne.io.BaseRaw,
         onset_trigger_to_wav: Mapping[int, str | Path],
-        end_triggers: int | Sequence[int],
+        end_triggers: int | Sequence[int] | None = None,
         *,
         stim_channel: str | None = None,
+        infer_missing_ends: bool = False,
+        base_audio_path: str | Path | None = None,
+        fallback_drift_us_per_s: float = DEFAULT_FALLBACK_DRIFT_US_PER_S,
     ) -> TRFSpanSpec:
-        """Build ordered, uniquely labelled trials, including repeated WAVs."""
-        trials = find_audio_trials(raw, onset_trigger_to_wav, end_triggers, stim_channel=stim_channel)
+        """Build ordered, uniquely labelled trials, including repeated WAVs.
+
+        Set infer_missing_ends=True to replace missing end triggers with WAV
+        duration * (1 + fallback_drift_us_per_s / 1e6), on the raw clock.
+        The default prior is +499 us/s; EpochTRF still estimates actual offset
+        and drift by cross-correlation when audio_channels are supplied.
+        Pass base_audio_path for relative WAV paths, and end_triggers=None
+        when no end-trigger codes exist. Actual end triggers take precedence.
+        End-inference provenance is retained in epoch metadata and reports;
+        the Raw trigger channel is not modified.
+        """
+        trials = find_audio_trials(
+            raw,
+            onset_trigger_to_wav,
+            end_triggers,
+            stim_channel=stim_channel,
+            infer_missing_ends=infer_missing_ends,
+            base_audio_path=base_audio_path,
+            fallback_drift_us_per_s=fallback_drift_us_per_s,
+        )
         spans: Spans = {}
         metadata: MetaMap = {}
         wavs: dict[str, str | Path] = {}
@@ -98,6 +120,13 @@ class TRFSpanSpec:
                 'onset_code': trial['onset_code'],
                 'end_code': trial['end_code'],
             }
+            if infer_missing_ends:
+                metadata[label] = {
+                    **metadata[label],
+                    'end_inferred': trial.get('end_inferred', False),
+                    'end_inference_drift_us_per_s': trial.get('end_inference_drift_us_per_s'),
+                    'end_inference_wav_duration_s': trial.get('end_inference_wav_duration_s'),
+                }
         return cls(spans, metadata, wavs)
 
 
@@ -188,9 +217,15 @@ def _build_trf_epochs(  # noqa: C901, PLR0915, PLR0912
     label_to_code: dict[str, int] = {}
     trial_records: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    end_inference_drift_counts: dict[str, int] = {}
 
     for label in spec.labels():
         on_samp, off_samp = spec.spans_by_label[label]
+        trial_metadata = spec.metadata_by_label.get(label, {})
+        end_inferred = bool(trial_metadata.get('end_inferred', False))
+        if end_inferred:
+            rate = str(float(trial_metadata['end_inference_drift_us_per_s']))
+            end_inference_drift_counts[rate] = end_inference_drift_counts.get(rate, 0) + 1
         wav = Path(spec.wav_by_label.get(label, Path(label).with_suffix(wav_ext)))
         if not wav.is_absolute():
             wav = base_audio_path / wav
@@ -198,7 +233,11 @@ def _build_trf_epochs(  # noqa: C901, PLR0915, PLR0912
             'label': label,
             'wav_file': str(wav),
             'original_onset_sample': int(on_samp),
-            'original_end_sample': None if off_samp is None else int(off_samp),
+            'original_end_sample': None if end_inferred or off_samp is None else int(off_samp),
+            'inferred_end_sample': int(off_samp) if end_inferred and off_samp is not None else None,
+            'end_inferred': end_inferred,
+            'end_inference_drift_us_per_s': trial_metadata.get('end_inference_drift_us_per_s'),
+            'end_inference_wav_duration_s': trial_metadata.get('end_inference_wav_duration_s'),
         }
         alignment = None
         if audio_channels is not None:
@@ -322,6 +361,8 @@ def _build_trf_epochs(  # noqa: C901, PLR0915, PLR0912
         'n_trials_aligned': len(trial_records),
         'n_trials_failed': len(failures),
         'n_trials_epoched': len(epochs_list),
+        'n_trials_end_inferred': sum(end_inference_drift_counts.values()),
+        'end_inference_drift_counts': end_inference_drift_counts,
         'summary': summarize_alignments(trial_records),
     }
     return epochs_all, alignment_info
@@ -455,6 +496,8 @@ class EpochTRF(AlmKanalStep):
             alignment = trf_info['alignment_info']
             columns = {
                 'label': 'Trial',
+                'end_inferred': 'End inferred',
+                'end_inference_drift_us_per_s': 'End prior (µs/s)',
                 'offset_s': 'Offset (s)',
                 'drift_us_per_s': 'Drift (µs/s)',
                 'total_drift_ms': 'Total drift (ms)',
@@ -471,6 +514,9 @@ class EpochTRF(AlmKanalStep):
                 f'(requested {self.hw_delay_s * 1000:g} ms). '
                 'WAV feature channels were left unchanged; positive values advance neural events '
                 'to compensate playback-to-ear delay, and negative values add lag.</p>'
+                f'<p>{alignment["n_trials_end_inferred"]} trial ends were inferred from WAV duration '
+                'and an assumed drift rate. These priors only defined trial spans; '
+                'the reported alignment drift was estimated from the audio.</p>'
                 + table.to_html(index=False, escape=True, float_format=lambda value: f'{value:.6g}')
             )
             if alignment['failures']:

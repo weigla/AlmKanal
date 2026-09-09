@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 VARIANCE_EPSILON = 1e-12
 ENERGY_EPSILON = 1e-20
 MIN_ANCHORS_FOR_DRIFT = 2
+DEFAULT_FALLBACK_DRIFT_US_PER_S = 499.0
 
 
 def resolve_stim_channel(raw: mne.io.BaseRaw, stim_channel: str | None) -> str:
@@ -37,28 +38,85 @@ def resolve_stim_channel(raw: mne.io.BaseRaw, stim_channel: str | None) -> str:
     return raw.ch_names[picks[0]]
 
 
-def find_audio_trials(  # noqa: C901
+def _infer_audio_trial_end(
+    trial: dict[str, Any],
+    raw: mne.io.BaseRaw,
+    boundary_sample: int,
+    base_audio_path: str | Path | None,
+    drift_us_per_s: float,
+) -> dict[str, Any]:
+    """Estimate a missing endpoint without writing a trigger into the Raw data."""
+    wav_path = Path(trial['wav_file'])
+    if not wav_path.is_absolute():
+        if base_audio_path is None:
+            raise ValueError('base_audio_path is required to infer trial ends from relative WAV paths.')
+        wav_path = Path(base_audio_path) / wav_path
+    if not wav_path.is_file():
+        raise FileNotFoundError(f'WAV file does not exist: {wav_path}')
+    duration_s = float(librosa.get_duration(path=wav_path))
+    if not np.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError(f'WAV duration must be finite and positive: {wav_path}')
+    duration_samples = int(round(duration_s * (1.0 + drift_us_per_s / 1e6) * raw.info['sfreq']))
+    end_sample = trial['onset_sample'] + duration_samples
+    if duration_samples < 1:
+        raise ValueError(f'Inferred trial duration must span at least one raw sample: {wav_path}')
+    if end_sample > boundary_sample:
+        raise RuntimeError(
+            f'Inferred end for WAV={wav_path} at sample {end_sample} exceeds the next audio onset '
+            f'or recording end at sample {boundary_sample}. Check the WAV, onset triggers, and fallback drift.'
+        )
+    # Endpoints passed to Raw.crop are inclusive; the recording stop is exclusive.
+    end_sample = min(end_sample, int(raw.first_samp + raw.n_times - 1))
+    if end_sample <= trial['onset_sample']:
+        raise ValueError(f'Insufficient recording samples to infer an end for WAV={wav_path}.')
+    return {
+        **trial,
+        'end_code': None,
+        'end_sample': end_sample,
+        'end_inferred': True,
+        'end_inference_drift_us_per_s': float(drift_us_per_s),
+        'end_inference_wav_duration_s': duration_s,
+    }
+
+
+def find_audio_trials(  # noqa: C901, PLR0912, PLR0915
     raw: mne.io.BaseRaw,
     onset_trigger_to_wav: Mapping[int, str | Path],
-    end_triggers: int | Sequence[int],
+    end_triggers: int | Sequence[int] | None = None,
     *,
     stim_channel: str | None = None,
+    infer_missing_ends: bool = False,
+    base_audio_path: str | Path | None = None,
+    fallback_drift_us_per_s: float = DEFAULT_FALLBACK_DRIFT_US_PER_S,
 ) -> list[dict[str, Any]]:
-    """Find complete trials while ignoring all unrelated trigger values."""
+    """Find trials, optionally inferring missing ends from WAV duration and drift.
+
+    Inference is opt-in and applies separately to each missing end; real end
+    triggers take precedence. With no end codes, pass end_triggers=None and
+    infer_missing_ends=True. Relative WAV paths require base_audio_path.
+    The inferred duration on the raw clock is WAV duration * (1 + drift / 1e6).
+    Positive drift therefore lengthens the span. This is only an endpoint
+    estimate, not a replacement for cross-correlation or a physical delay.
+    Inferred spans may not extend past the next onset or the recording end.
+    """
     if not onset_trigger_to_wav:
         raise ValueError('onset_trigger_to_wav must contain at least one onset-trigger/WAV pair.')
+    if infer_missing_ends and (not np.isfinite(fallback_drift_us_per_s) or 1.0 + fallback_drift_us_per_s / 1e6 <= 0):
+        raise ValueError('fallback_drift_us_per_s must be finite and yield a positive clock slope (> -1000000).')
 
     stim_channel = resolve_stim_channel(raw, stim_channel)
     trigger_to_wav = {int(code): wav_file for code, wav_file in onset_trigger_to_wav.items()}
     if len(trigger_to_wav) != len(onset_trigger_to_wav):
         raise ValueError('onset_trigger_to_wav contains trigger keys that collapse to the same integer value.')
     onset_codes = set(trigger_to_wav)
-    if isinstance(end_triggers, Integral):
+    if end_triggers is None:
+        end_codes = set()
+    elif isinstance(end_triggers, Integral):
         end_codes = {int(end_triggers)}
     else:
         end_codes = {int(code) for code in cast('Sequence[int]', end_triggers)}
-    if not end_codes:
-        raise ValueError('end_triggers must contain at least one trigger value.')
+    if not end_codes and not infer_missing_ends:
+        raise ValueError('end_triggers must contain at least one trigger value unless infer_missing_ends=True.')
     overlap = onset_codes & end_codes
     if overlap:
         raise ValueError(f'Trigger values cannot be both onset and end triggers: {sorted(overlap)}')
@@ -81,7 +139,9 @@ def find_audio_trials(  # noqa: C901
 
         if event_value in onset_codes:
             if current is not None:
-                raise RuntimeError('New audio onset before the preceding end trigger.')
+                if not infer_missing_ends:
+                    raise RuntimeError('New audio onset before the preceding end trigger.')
+                trials.append(_infer_audio_trial_end(current, raw, sample, base_audio_path, fallback_drift_us_per_s))
             current = {
                 'onset_code': event_value,
                 'wav_file': str(trigger_to_wav[event_value]),
@@ -94,7 +154,14 @@ def find_audio_trials(  # noqa: C901
             current = None
 
     if current is not None:
-        warnings.warn('The final audio trial has no end trigger and was ignored.', stacklevel=2)
+        if infer_missing_ends:
+            trials.append(
+                _infer_audio_trial_end(
+                    current, raw, int(raw.first_samp + raw.n_times), base_audio_path, fallback_drift_us_per_s
+                )
+            )
+        else:
+            warnings.warn('The final audio trial has no end trigger and was ignored.', stacklevel=2)
 
     return trials
 
