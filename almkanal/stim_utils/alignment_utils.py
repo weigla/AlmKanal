@@ -22,6 +22,8 @@ VARIANCE_EPSILON = 1e-12
 ENERGY_EPSILON = 1e-20
 MIN_ANCHORS_FOR_DRIFT = 2
 DEFAULT_FALLBACK_DRIFT_US_PER_S = 499.0
+LAG_LIMIT_MARGIN_FRACTION = 0.05
+MIN_ANCHOR_TIME_COVERAGE = 0.5
 
 
 def resolve_stim_channel(raw: mne.io.BaseRaw, stim_channel: str | None) -> str:
@@ -273,6 +275,46 @@ def _estimate_window_lag(
     return float(lag_s), peak_correlation
 
 
+def _alignment_quality_warnings(
+    alignment: Mapping[str, Any],
+    anchor_lags: NDArray[np.float64],
+    inlier_times: NDArray[np.float64],
+    candidate_times: NDArray[np.float64],
+    *,
+    max_lag_s: float,
+    sync_sfreq: float,
+    warn_residual_rms_ms: float,
+) -> list[str]:
+    """Flag poor fit precision, a limited search range, or limited time coverage."""
+    reasons = []
+    if alignment['residual_rms_ms'] > warn_residual_rms_ms:
+        reasons.append(
+            f'inlier residual RMS {alignment["residual_rms_ms"]:.3f} ms exceeds '
+            f'the warning threshold of {warn_residual_rms_ms:g} ms'
+        )
+
+    # Match the actual search grid, including a requested range below one sample.
+    lag_limit_s = round(max_lag_s * sync_sfreq) / sync_sfreq
+    margin_s = max(1.0 / sync_sfreq, LAG_LIMIT_MARGIN_FRACTION * lag_limit_s)
+    endpoint_lags = alignment['offset_s'] + (alignment['clock_slope'] - 1.0) * np.array(
+        [0.0, alignment['wav_duration_s']]
+    )
+    if lag_limit_s == 0:
+        reasons.append('max_lag_s permits no nonzero lag search at the synchronization sampling rate')
+    elif np.any(np.abs(anchor_lags) >= lag_limit_s - margin_s) or np.any(
+        np.abs(endpoint_lags) >= lag_limit_s - margin_s
+    ):
+        reasons.append(
+            f'accepted window lags or the fitted lag over the full stimulus approach or exceed '
+            f'the +/-{lag_limit_s:g} s search limit (max_lag_s={max_lag_s:g})'
+        )
+
+    coverage = float(np.ptp(inlier_times) / np.ptp(candidate_times))
+    if coverage < MIN_ANCHOR_TIME_COVERAGE:
+        reasons.append(f'inlier anchors span only {coverage:.1%} of the evaluated trial duration')
+    return reasons
+
+
 def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     raw_trial: mne.io.BaseRaw,
     wav_file: str | Path,
@@ -287,9 +329,30 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     min_corr: float = 0.30,
     min_anchors: int = 5,
     reject_outliers: bool = True,
+    warn_residual_rms_ms: float = 10.0,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Estimate ``t_raw = offset + clock_slope * t_wav`` for one trial."""
+    """Estimate ``t_raw = offset + clock_slope * t_wav`` for one trial.
+
+    max_lag_s is the search half-width around zero lag for EVERY window; the
+    search does not follow accumulated drift. Choose it to exceed the largest
+    absolute ``offset_s + drift_us_per_s * t / 1e6`` over the full stimulus,
+    with additional margin. Stimulus duration therefore matters: +500 us/s
+    accumulates 0.63 s over 1260 s, exceeding the default +/-0.25 s search even
+    with zero initial offset. For that example, max_lag_s=1.0 allows margin.
+    Inferring a missing trial end does not widen this search range.
+
+    RuntimeWarning flags potentially unreliable fits when inlier residual RMS
+    exceeds warn_residual_rms_ms (default 10 ms), accepted lags or fitted
+    endpoint lags approach the search limit (within 5% or one synchronization
+    sample), or inlier anchors span less than half the evaluated time range.
+    These are heuristic checks, not a guarantee of correct alignment; residual
+    RMS measures agreement with the fitted line, not absolute timing accuracy.
+    Warnings are emitted even with verbose=False and their reasons are returned
+    in quality_warnings. The fit is still returned without changing the search
+    range or rejecting the trial. Inspect the audio match and adjust max_lag_s
+    or the configurable residual warning threshold as appropriate.
+    """
     if not isinstance(raw_trial, mne.io.BaseRaw):
         raise TypeError('raw_trial must be an MNE Raw object.')
     if isinstance(audio_channels, str) or not audio_channels:
@@ -302,6 +365,8 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
         raise ValueError('min_corr must be between -1 and 1.')
     if min_anchors < MIN_ANCHORS_FOR_DRIFT:
         raise ValueError('min_anchors must be at least 2 to estimate clock drift.')
+    if not np.isfinite(warn_residual_rms_ms) or warn_residual_rms_ms <= 0:
+        raise ValueError('warn_residual_rms_ms must be finite and positive.')
 
     raw_sfreq = float(raw_trial.info['sfreq'])
     missing = [channel for channel in audio_channels if channel not in raw_trial.ch_names]
@@ -362,7 +427,7 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
     last_center = usable_duration - window_s / 2 - max_lag_s
     if last_center < first_center:
         raise RuntimeError('Trial is too short for the requested synchronization settings.')
-    centers = np.arange(first_center, last_center + 1e-12, step_s)
+    centers = np.arange(first_center, last_center + 1e-12, step_s, dtype=np.float64)
 
     best_pair: tuple[int, int] | None = None
     best_score = -np.inf
@@ -444,6 +509,24 @@ def estimate_raw_wav_alignment(  # noqa: C901, PLR0912, PLR0915
         'selected_recorded_channel': audio_channels[best_recorded_index],
         'selected_wav_channel': int(best_wav_index),
     }
+    alignment['quality_warnings'] = _alignment_quality_warnings(
+        alignment,
+        anchor_lags,
+        anchor_times[inliers],
+        centers,
+        max_lag_s=max_lag_s,
+        sync_sfreq=sync_sfreq,
+        warn_residual_rms_ms=warn_residual_rms_ms,
+    )
+    if alignment['quality_warnings']:
+        warnings.warn(
+            f'Potentially unreliable audio alignment for {wav_path.name} '
+            f'({wav_duration_s:g} s stimulus): ' + '; '.join(alignment['quality_warnings']) + '. '
+            'Inspect the audio match and consider increasing max_lag_s, especially for long stimuli. '
+            'The fitted alignment is still returned.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if verbose:
         mne.utils.logger.info(

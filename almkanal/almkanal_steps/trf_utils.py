@@ -393,6 +393,10 @@ def build_trf_epochs(
     the 16.5 ms playback-to-ear delay when the audio reference precedes the
     air tubes. Negative values add lag and emit a warning. The added WAV
     feature channels are never delay-shifted.
+
+    For long stimuli, increase alignment_kwargs['max_lag_s'] to accommodate
+    initial offset plus drift accumulated over the full WAV duration. See
+    estimate_raw_wav_alignment for search-range guidance and fit warnings.
     """
     epochs, _ = _build_trf_epochs(
         raw,
@@ -428,6 +432,16 @@ class EpochTRF(AlmKanalStep):
     Physical delays are rounded to the nearest sample on the corrected clock.
     Realignment retains recording margins to preserve the full WAV duration;
     insufficient recording coverage is an alignment error.
+
+    The alignment search uses a fixed +/-max_lag_s range around zero for each
+    window. Set alignment_kwargs['max_lag_s'] large enough for the initial
+    offset plus accumulated drift over the FULL stimulus: 1260 s at +500 us/s
+    adds 0.63 s, so a 1.0 s search is more appropriate than the 0.25 s default
+    for a small initial offset. Missing-end inference does not adapt this range.
+    Potentially unreliable fits emit RuntimeWarning, including with
+    verbose=False, but are still applied; on_alignment_error only handles errors.
+    alignment_kwargs['warn_residual_rms_ms'] sets the residual RMS warning
+    threshold (default 10 ms). See estimate_raw_wav_alignment for all checks.
     """
 
     gen_span_spec: Callable
